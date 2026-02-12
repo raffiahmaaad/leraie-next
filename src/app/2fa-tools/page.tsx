@@ -8,8 +8,14 @@ import {
   formatSecret,
   parseOtpAuthUri,
 } from "@/lib/totp";
+import {
+  generateGoogleAuthMigrationURIs,
+  parseGoogleAuthMigrationURI,
+} from "@/lib/google-auth";
+import { exportToAegisJSON, parseAegisJSON } from "@/lib/aegis";
 import { Header } from "@/components";
 import jsQR from "jsqr";
+import { QRCodeSVG } from "qrcode.react";
 
 interface Account {
   id: string;
@@ -41,6 +47,11 @@ export default function TwoFATools() {
   const streamRef = useRef<MediaStream | null>(null);
   const scanIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const importFileRef = useRef<HTMLInputElement>(null);
+  const aegisImportRef = useRef<HTMLInputElement>(null);
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportQRIndex, setExportQRIndex] = useState(0);
+  const [exportURIs, setExportURIs] = useState<string[]>([]);
+  const [showImportExportMenu, setShowImportExportMenu] = useState(false);
 
   useEffect(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -367,6 +378,53 @@ export default function TwoFATools() {
   };
 
   const handleQRResult = (data: string) => {
+    // Try Google Authenticator migration format first
+    if (data.startsWith("otpauth-migration://")) {
+      const migrationAccounts = parseGoogleAuthMigrationURI(data);
+      if (!migrationAccounts || migrationAccounts.length === 0) {
+        setScannerStatus("Failed to parse Google Authenticator QR code.");
+        return;
+      }
+
+      let added = 0;
+      let skipped = 0;
+      const newAccounts = [...accounts];
+
+      for (const ma of migrationAccounts) {
+        if (
+          newAccounts.some(
+            (acc) =>
+              acc.name.toLowerCase() === ma.name.toLowerCase() ||
+              acc.secret === ma.secret,
+          )
+        ) {
+          skipped++;
+          continue;
+        }
+        newAccounts.push({
+          id: Date.now().toString() + Math.random().toString(36).slice(2),
+          name: ma.name,
+          secret: ma.secret,
+          createdAt: Date.now(),
+        });
+        added++;
+      }
+
+      setAccounts(newAccounts);
+      stopQRScanner();
+
+      if (added > 0) {
+        showToast(
+          `Imported ${added} account(s) from Google Auth${skipped > 0 ? `, skipped ${skipped}` : ""}`,
+          "success",
+        );
+      } else {
+        showToast("All accounts already exist", "error");
+      }
+      return;
+    }
+
+    // Try standard otpauth:// URI
     const parsed = parseOtpAuthUri(data);
     if (!parsed) {
       setScannerStatus("Invalid QR code. Please scan a TOTP QR code.");
@@ -412,6 +470,100 @@ export default function TwoFATools() {
     }
     setShowQRScanner(false);
     setScannerStatus("");
+  };
+
+  // === Google Auth Export ===
+  const handleExportGoogleAuth = () => {
+    if (accounts.length === 0) {
+      showToast("No accounts to export", "error");
+      return;
+    }
+    const simpleAccounts = accounts.map((acc) => ({
+      name: acc.name,
+      secret: acc.secret,
+    }));
+    const uris = generateGoogleAuthMigrationURIs(simpleAccounts);
+    setExportURIs(uris);
+    setExportQRIndex(0);
+    setShowExportModal(true);
+    setShowImportExportMenu(false);
+  };
+
+  // === Aegis Export ===
+  const handleExportAegis = () => {
+    if (accounts.length === 0) {
+      return showToast("No accounts to export", "error");
+    }
+    const simpleAccounts = accounts.map((acc) => ({
+      name: acc.name,
+      secret: acc.secret,
+    }));
+    const json = exportToAegisJSON(simpleAccounts);
+    const blob = new Blob([json], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const date = new Date().toISOString().slice(0, 10);
+    a.href = url;
+    a.download = `aegis-export-${date}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setShowImportExportMenu(false);
+    showToast("Aegis backup downloaded!", "success");
+  };
+
+  // === Aegis Import ===
+  const handleImportAegis = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const content = ev.target?.result as string;
+      const parsed = parseAegisJSON(content);
+      if (!parsed) {
+        return showToast("Invalid Aegis backup file", "error");
+      }
+
+      let added = 0;
+      let skipped = 0;
+      const newAccounts = [...accounts];
+
+      for (const item of parsed) {
+        if (
+          !item.secret ||
+          !isValidSecret(item.secret) ||
+          newAccounts.some(
+            (acc) =>
+              acc.name.toLowerCase() === item.name.toLowerCase() ||
+              acc.secret === item.secret,
+          )
+        ) {
+          skipped++;
+          continue;
+        }
+
+        newAccounts.push({
+          id: Date.now().toString() + Math.random().toString(36).slice(2),
+          name: item.name,
+          secret: item.secret,
+          createdAt: Date.now(),
+        });
+        added++;
+      }
+
+      setAccounts(newAccounts);
+      if (added > 0) {
+        showToast(
+          `Imported ${added} account(s) from Aegis${skipped > 0 ? `, skipped ${skipped}` : ""}`,
+          "success",
+        );
+      } else {
+        showToast("No new accounts to import", "error");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+    setShowImportExportMenu(false);
   };
 
   const progress = (remainingSeconds / 30) * 100;
@@ -663,12 +815,19 @@ export default function TwoFATools() {
               </div>
             </div>
 
-            {/* Hidden file input for import */}
+            {/* Hidden file inputs */}
             <input
               ref={importFileRef}
               type="file"
               accept=".json"
               onChange={handleImportJSON}
+              style={{ display: "none" }}
+            />
+            <input
+              ref={aegisImportRef}
+              type="file"
+              accept=".json"
+              onChange={handleImportAegis}
               style={{ display: "none" }}
             />
           </div>
@@ -698,7 +857,14 @@ export default function TwoFATools() {
                   {accounts.length}
                 </span>
               </h3>
-              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+              <div
+                style={{
+                  display: "flex",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                  position: "relative",
+                }}
+              >
                 {accounts.length > 0 && (
                   <>
                     <button
@@ -721,31 +887,257 @@ export default function TwoFATools() {
                           d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
                         />
                       </svg>
-                      JSON
-                    </button>
-                    <button
-                      onClick={exportBackupTXT}
-                      className="btn btn-secondary"
-                      style={{ padding: "8px 16px", fontSize: "13px" }}
-                      title="Download backup as readable TXT file"
-                    >
-                      <svg
-                        width="16"
-                        height="16"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                      >
-                        <path
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth={2}
-                          d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
-                        />
-                      </svg>
                       TXT
                     </button>
                   </>
+                )}
+
+                {/* Import/Export Menu Button */}
+                <button
+                  onClick={() => setShowImportExportMenu(!showImportExportMenu)}
+                  className="btn btn-secondary"
+                  style={{ padding: "8px 16px", fontSize: "13px" }}
+                  title="Import / Export options"
+                >
+                  <svg
+                    width="16"
+                    height="16"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"
+                    />
+                  </svg>
+                  More
+                </button>
+
+                {/* Dropdown Menu */}
+                {showImportExportMenu && (
+                  <div
+                    style={{
+                      position: "absolute",
+                      top: "100%",
+                      right: 0,
+                      marginTop: "8px",
+                      background: "var(--color-surface-elevated, #1e1e2e)",
+                      border: "1px solid var(--color-border)",
+                      borderRadius: "12px",
+                      padding: "8px",
+                      minWidth: "220px",
+                      zIndex: 50,
+                      boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+                    }}
+                  >
+                    <p
+                      style={{
+                        fontSize: "11px",
+                        fontWeight: "600",
+                        color: "var(--color-text-muted)",
+                        padding: "6px 12px 4px",
+                        textTransform: "uppercase",
+                        letterSpacing: "0.05em",
+                      }}
+                    >
+                      Export To
+                    </p>
+                    <button
+                      onClick={handleExportGoogleAuth}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "10px",
+                        width: "100%",
+                        padding: "10px 12px",
+                        background: "none",
+                        border: "none",
+                        color: "var(--color-text)",
+                        fontSize: "14px",
+                        cursor: "pointer",
+                        borderRadius: "8px",
+                        textAlign: "left",
+                        transition: "background 0.15s",
+                      }}
+                      onMouseOver={(e) =>
+                        (e.currentTarget.style.background =
+                          "var(--color-surface)")
+                      }
+                      onMouseOut={(e) =>
+                        (e.currentTarget.style.background = "none")
+                      }
+                    >
+                      📱 Google Authenticator (QR)
+                    </button>
+                    <button
+                      onClick={handleExportAegis}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "10px",
+                        width: "100%",
+                        padding: "10px 12px",
+                        background: "none",
+                        border: "none",
+                        color: "var(--color-text)",
+                        fontSize: "14px",
+                        cursor: "pointer",
+                        borderRadius: "8px",
+                        textAlign: "left",
+                        transition: "background 0.15s",
+                      }}
+                      onMouseOver={(e) =>
+                        (e.currentTarget.style.background =
+                          "var(--color-surface)")
+                      }
+                      onMouseOut={(e) =>
+                        (e.currentTarget.style.background = "none")
+                      }
+                    >
+                      🛡️ Aegis Authenticator (JSON)
+                    </button>
+                    <button
+                      onClick={exportBackupTXT}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "10px",
+                        width: "100%",
+                        padding: "10px 12px",
+                        background: "none",
+                        border: "none",
+                        color: "var(--color-text)",
+                        fontSize: "14px",
+                        cursor: "pointer",
+                        borderRadius: "8px",
+                        textAlign: "left",
+                        transition: "background 0.15s",
+                      }}
+                      onMouseOver={(e) =>
+                        (e.currentTarget.style.background =
+                          "var(--color-surface)")
+                      }
+                      onMouseOut={(e) =>
+                        (e.currentTarget.style.background = "none")
+                      }
+                    >
+                      📄 Plain Text (TXT)
+                    </button>
+
+                    <div
+                      style={{
+                        height: "1px",
+                        background: "var(--color-border)",
+                        margin: "6px 0",
+                      }}
+                    />
+
+                    <p
+                      style={{
+                        fontSize: "11px",
+                        fontWeight: "600",
+                        color: "var(--color-text-muted)",
+                        padding: "6px 12px 4px",
+                        textTransform: "uppercase",
+                        letterSpacing: "0.05em",
+                      }}
+                    >
+                      Import From
+                    </p>
+                    <button
+                      onClick={() => {
+                        setShowImportExportMenu(false);
+                        startQRScanner();
+                      }}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "10px",
+                        width: "100%",
+                        padding: "10px 12px",
+                        background: "none",
+                        border: "none",
+                        color: "var(--color-text)",
+                        fontSize: "14px",
+                        cursor: "pointer",
+                        borderRadius: "8px",
+                        textAlign: "left",
+                        transition: "background 0.15s",
+                      }}
+                      onMouseOver={(e) =>
+                        (e.currentTarget.style.background =
+                          "var(--color-surface)")
+                      }
+                      onMouseOut={(e) =>
+                        (e.currentTarget.style.background = "none")
+                      }
+                    >
+                      📱 Google Authenticator (Scan QR)
+                    </button>
+                    <button
+                      onClick={() => {
+                        setShowImportExportMenu(false);
+                        aegisImportRef.current?.click();
+                      }}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "10px",
+                        width: "100%",
+                        padding: "10px 12px",
+                        background: "none",
+                        border: "none",
+                        color: "var(--color-text)",
+                        fontSize: "14px",
+                        cursor: "pointer",
+                        borderRadius: "8px",
+                        textAlign: "left",
+                        transition: "background 0.15s",
+                      }}
+                      onMouseOver={(e) =>
+                        (e.currentTarget.style.background =
+                          "var(--color-surface)")
+                      }
+                      onMouseOut={(e) =>
+                        (e.currentTarget.style.background = "none")
+                      }
+                    >
+                      🛡️ Aegis Authenticator (JSON)
+                    </button>
+                    <button
+                      onClick={() => {
+                        setShowImportExportMenu(false);
+                        importFileRef.current?.click();
+                      }}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "10px",
+                        width: "100%",
+                        padding: "10px 12px",
+                        background: "none",
+                        border: "none",
+                        color: "var(--color-text)",
+                        fontSize: "14px",
+                        cursor: "pointer",
+                        borderRadius: "8px",
+                        textAlign: "left",
+                        transition: "background 0.15s",
+                      }}
+                      onMouseOver={(e) =>
+                        (e.currentTarget.style.background =
+                          "var(--color-surface)")
+                      }
+                      onMouseOut={(e) =>
+                        (e.currentTarget.style.background = "none")
+                      }
+                    >
+                      📋 Leraie Backup (JSON)
+                    </button>
+                  </div>
                 )}
               </div>
             </div>
@@ -1362,6 +1754,177 @@ export default function TwoFATools() {
             </button>
           </div>
         </div>
+      )}
+
+      {/* Google Auth Export Modal */}
+      {showExportModal && exportURIs.length > 0 && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0, 0, 0, 0.85)",
+            backdropFilter: "blur(8px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 200,
+          }}
+          onClick={() => setShowExportModal(false)}
+        >
+          <div
+            className="glass-card animate-fade-in"
+            style={{
+              padding: "32px",
+              width: "100%",
+              maxWidth: "420px",
+              margin: "24px",
+              textAlign: "center",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                marginBottom: "20px",
+              }}
+            >
+              <h3
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "10px",
+                  margin: 0,
+                }}
+              >
+                📱 Export to Google Auth
+              </h3>
+              <button
+                onClick={() => setShowExportModal(false)}
+                className="btn-icon"
+                style={{ color: "var(--color-text-muted)" }}
+              >
+                <svg
+                  width="22"
+                  height="22"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M6 18L18 6M6 6l12 12"
+                  />
+                </svg>
+              </button>
+            </div>
+
+            <p
+              style={{
+                fontSize: "14px",
+                color: "var(--color-text-secondary)",
+                marginBottom: "20px",
+              }}
+            >
+              Open Google Authenticator → tap &quot;+&quot; → &quot;Import
+              existing accounts&quot; → scan the QR below
+            </p>
+
+            {/* QR Code */}
+            <div
+              style={{
+                background: "white",
+                padding: "24px",
+                borderRadius: "16px",
+                display: "inline-block",
+                marginBottom: "20px",
+              }}
+            >
+              <QRCodeSVG
+                value={exportURIs[exportQRIndex]}
+                size={256}
+                level="M"
+              />
+            </div>
+
+            {/* Batch indicator */}
+            {exportURIs.length > 1 && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "16px",
+                  marginBottom: "16px",
+                }}
+              >
+                <button
+                  onClick={() =>
+                    setExportQRIndex((prev) => Math.max(0, prev - 1))
+                  }
+                  className="btn btn-secondary"
+                  style={{ padding: "8px 16px" }}
+                  disabled={exportQRIndex === 0}
+                >
+                  ← Prev
+                </button>
+                <span
+                  style={{
+                    fontSize: "14px",
+                    fontWeight: "600",
+                    color: "var(--color-text-secondary)",
+                  }}
+                >
+                  {exportQRIndex + 1} / {exportURIs.length}
+                </span>
+                <button
+                  onClick={() =>
+                    setExportQRIndex((prev) =>
+                      Math.min(exportURIs.length - 1, prev + 1),
+                    )
+                  }
+                  className="btn btn-secondary"
+                  style={{ padding: "8px 16px" }}
+                  disabled={exportQRIndex === exportURIs.length - 1}
+                >
+                  Next →
+                </button>
+              </div>
+            )}
+
+            <p
+              style={{
+                fontSize: "13px",
+                color: "var(--color-text-muted)",
+              }}
+            >
+              {accounts.length} account(s) in {exportURIs.length} QR code(s)
+            </p>
+
+            <button
+              onClick={() => setShowExportModal(false)}
+              className="btn btn-secondary"
+              style={{ width: "100%", marginTop: "16px" }}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Import/Export menu backdrop */}
+      {showImportExportMenu && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 40,
+          }}
+          onClick={() => setShowImportExportMenu(false)}
+        />
       )}
 
       {/* Toast */}
