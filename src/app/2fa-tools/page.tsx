@@ -1,13 +1,15 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   generateTOTP,
   getRemainingSeconds,
   isValidSecret,
   formatSecret,
+  parseOtpAuthUri,
 } from "@/lib/totp";
 import { Header } from "@/components";
+import jsQR from "jsqr";
 
 interface Account {
   id: string;
@@ -32,6 +34,13 @@ export default function TwoFATools() {
   const [isLoaded, setIsLoaded] = useState(false);
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
   const [editForm, setEditForm] = useState({ name: "", secret: "" });
+  const [showQRScanner, setShowQRScanner] = useState(false);
+  const [scannerStatus, setScannerStatus] = useState<string>("");
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const scanIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const importFileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -231,6 +240,180 @@ export default function TwoFATools() {
     showToast("TXT backup downloaded!", "success");
   };
 
+  // === Import JSON ===
+  const handleImportJSON = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target?.result as string);
+        if (!Array.isArray(data)) {
+          return showToast("Invalid backup file format", "error");
+        }
+
+        let added = 0;
+        let skipped = 0;
+        const newAccounts = [...accounts];
+
+        for (const item of data) {
+          const name = item.name?.trim();
+          const secret = item.secret?.replace(/\s/g, "").toUpperCase();
+
+          if (!name || !secret || !isValidSecret(secret)) {
+            skipped++;
+            continue;
+          }
+
+          // Skip duplicates (by name or secret)
+          if (
+            newAccounts.some(
+              (acc) =>
+                acc.name.toLowerCase() === name.toLowerCase() ||
+                acc.secret === secret,
+            )
+          ) {
+            skipped++;
+            continue;
+          }
+
+          newAccounts.push({
+            id: Date.now().toString() + Math.random().toString(36).slice(2),
+            name,
+            secret,
+            createdAt: item.createdAt
+              ? new Date(item.createdAt).getTime()
+              : Date.now(),
+          });
+          added++;
+        }
+
+        setAccounts(newAccounts);
+
+        if (added > 0 && skipped > 0) {
+          showToast(
+            `Imported ${added} account(s), skipped ${skipped}`,
+            "success",
+          );
+        } else if (added > 0) {
+          showToast(`Imported ${added} account(s) successfully`, "success");
+        } else {
+          showToast(
+            "No new accounts to import (all duplicates or invalid)",
+            "error",
+          );
+        }
+      } catch {
+        showToast("Failed to parse backup file", "error");
+      }
+    };
+    reader.readAsText(file);
+    // Reset input so the same file can be selected again
+    e.target.value = "";
+  };
+
+  // === QR Scanner ===
+  const startQRScanner = async () => {
+    setShowQRScanner(true);
+    setScannerStatus("Requesting camera access...");
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" },
+      });
+      streamRef.current = stream;
+
+      // Wait for ref to be available
+      setTimeout(() => {
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.play();
+          setScannerStatus("Point your camera at a QR code");
+          startScanning();
+        }
+      }, 100);
+    } catch {
+      setScannerStatus("Camera access denied. Please allow camera permission.");
+    }
+  };
+
+  const startScanning = () => {
+    scanIntervalRef.current = setInterval(() => {
+      if (!videoRef.current || !canvasRef.current) return;
+
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+
+      if (video.readyState !== video.HAVE_ENOUGH_DATA) return;
+
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+      const code = jsQR(imageData.data, imageData.width, imageData.height, {
+        inversionAttempts: "dontInvert",
+      });
+
+      if (code?.data) {
+        handleQRResult(code.data);
+      }
+    }, 250);
+  };
+
+  const handleQRResult = (data: string) => {
+    const parsed = parseOtpAuthUri(data);
+    if (!parsed) {
+      setScannerStatus("Invalid QR code. Please scan a TOTP QR code.");
+      return;
+    }
+
+    // Check for duplicates
+    if (
+      accounts.some(
+        (acc) =>
+          acc.name.toLowerCase() === parsed.name.toLowerCase() ||
+          acc.secret === parsed.secret,
+      )
+    ) {
+      stopQRScanner();
+      showToast(`Account "${parsed.name}" already exists`, "error");
+      return;
+    }
+
+    // Add the account
+    setAccounts((prev) => [
+      ...prev,
+      {
+        id: Date.now().toString(),
+        name: parsed.name,
+        secret: parsed.secret,
+        createdAt: Date.now(),
+      },
+    ]);
+
+    stopQRScanner();
+    showToast(`"${parsed.name}" added from QR code!`, "success");
+  };
+
+  const stopQRScanner = () => {
+    if (scanIntervalRef.current) {
+      clearInterval(scanIntervalRef.current);
+      scanIntervalRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+    setShowQRScanner(false);
+    setScannerStatus("");
+  };
+
   const progress = (remainingSeconds / 30) * 100;
 
   return (
@@ -413,6 +596,81 @@ export default function TwoFATools() {
                 Add Account
               </button>
             </form>
+
+            {/* Divider */}
+            <div
+              style={{
+                borderTop: "1px solid var(--color-border)",
+                marginTop: "8px",
+                paddingTop: "20px",
+              }}
+            >
+              <p
+                style={{
+                  fontSize: "13px",
+                  color: "var(--color-text-muted)",
+                  marginBottom: "14px",
+                  textAlign: "center",
+                }}
+              >
+                Or add account via
+              </p>
+              <div style={{ display: "flex", gap: "10px" }}>
+                <button
+                  onClick={startQRScanner}
+                  className="btn btn-secondary"
+                  style={{ flex: 1, padding: "10px 14px", fontSize: "13px" }}
+                  title="Scan QR code from camera"
+                >
+                  <svg
+                    width="18"
+                    height="18"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"
+                    />
+                  </svg>
+                  Scan QR
+                </button>
+                <button
+                  onClick={() => importFileRef.current?.click()}
+                  className="btn btn-secondary"
+                  style={{ flex: 1, padding: "10px 14px", fontSize: "13px" }}
+                  title="Import from JSON backup"
+                >
+                  <svg
+                    width="18"
+                    height="18"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"
+                    />
+                  </svg>
+                  Import
+                </button>
+              </div>
+            </div>
+
+            {/* Hidden file input for import */}
+            <input
+              ref={importFileRef}
+              type="file"
+              accept=".json"
+              onChange={handleImportJSON}
+              style={{ display: "none" }}
+            />
           </div>
 
           {/* Main Content */}
@@ -440,54 +698,56 @@ export default function TwoFATools() {
                   {accounts.length}
                 </span>
               </h3>
-              {accounts.length > 0 && (
-                <div style={{ display: "flex", gap: "8px" }}>
-                  <button
-                    onClick={exportBackupJSON}
-                    className="btn btn-secondary"
-                    style={{ padding: "8px 16px", fontSize: "13px" }}
-                    title="Download backup as JSON file"
-                  >
-                    <svg
-                      width="16"
-                      height="16"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke="currentColor"
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                {accounts.length > 0 && (
+                  <>
+                    <button
+                      onClick={exportBackupJSON}
+                      className="btn btn-secondary"
+                      style={{ padding: "8px 16px", fontSize: "13px" }}
+                      title="Download backup as JSON file"
                     >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
-                      />
-                    </svg>
-                    JSON
-                  </button>
-                  <button
-                    onClick={exportBackupTXT}
-                    className="btn btn-secondary"
-                    style={{ padding: "8px 16px", fontSize: "13px" }}
-                    title="Download backup as readable TXT file"
-                  >
-                    <svg
-                      width="16"
-                      height="16"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke="currentColor"
+                      <svg
+                        width="16"
+                        height="16"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
+                        />
+                      </svg>
+                      JSON
+                    </button>
+                    <button
+                      onClick={exportBackupTXT}
+                      className="btn btn-secondary"
+                      style={{ padding: "8px 16px", fontSize: "13px" }}
+                      title="Download backup as readable TXT file"
                     >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
-                      />
-                    </svg>
-                    TXT
-                  </button>
-                </div>
-              )}
+                      <svg
+                        width="16"
+                        height="16"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
+                        />
+                      </svg>
+                      TXT
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
 
             {!isLoaded ? (
@@ -951,6 +1211,159 @@ export default function TwoFATools() {
         </div>
       )}
 
+      {/* QR Scanner Modal */}
+      {showQRScanner && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0, 0, 0, 0.85)",
+            backdropFilter: "blur(8px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 200,
+          }}
+          onClick={stopQRScanner}
+        >
+          <div
+            className="glass-card animate-fade-in"
+            style={{
+              padding: "32px",
+              width: "100%",
+              maxWidth: "480px",
+              margin: "24px",
+              textAlign: "center",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                marginBottom: "20px",
+              }}
+            >
+              <h3
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "10px",
+                  margin: 0,
+                }}
+              >
+                <svg
+                  width="22"
+                  height="22"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="#6366f1"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"
+                  />
+                </svg>
+                Scan QR Code
+              </h3>
+              <button
+                onClick={stopQRScanner}
+                className="btn-icon"
+                style={{ color: "var(--color-text-muted)" }}
+              >
+                <svg
+                  width="22"
+                  height="22"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M6 18L18 6M6 6l12 12"
+                  />
+                </svg>
+              </button>
+            </div>
+
+            {/* Video preview */}
+            <div
+              style={{
+                position: "relative",
+                width: "100%",
+                borderRadius: "16px",
+                overflow: "hidden",
+                background: "#000",
+                aspectRatio: "1",
+                marginBottom: "16px",
+              }}
+            >
+              <video
+                ref={videoRef}
+                style={{
+                  width: "100%",
+                  height: "100%",
+                  objectFit: "cover",
+                }}
+                playsInline
+                muted
+              />
+              {/* Scan overlay corners */}
+              <div
+                style={{
+                  position: "absolute",
+                  inset: "15%",
+                  border: "3px solid rgba(99, 102, 241, 0.7)",
+                  borderRadius: "16px",
+                  pointerEvents: "none",
+                  boxShadow:
+                    "0 0 0 9999px rgba(0, 0, 0, 0.3), inset 0 0 20px rgba(99, 102, 241, 0.15)",
+                }}
+              />
+              {/* Scanning animation line */}
+              <div
+                style={{
+                  position: "absolute",
+                  left: "15%",
+                  right: "15%",
+                  height: "3px",
+                  background:
+                    "linear-gradient(90deg, transparent, #6366f1, transparent)",
+                  animation: "scanLine 2s ease-in-out infinite",
+                  pointerEvents: "none",
+                }}
+              />
+            </div>
+
+            {/* Hidden canvas for frame capture */}
+            <canvas ref={canvasRef} style={{ display: "none" }} />
+
+            <p
+              style={{
+                fontSize: "14px",
+                color: "var(--color-text-secondary)",
+                margin: "0 0 16px",
+              }}
+            >
+              {scannerStatus}
+            </p>
+
+            <button
+              onClick={stopQRScanner}
+              className="btn btn-secondary"
+              style={{ width: "100%" }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Toast */}
       {toast && (
         <div
@@ -964,6 +1377,17 @@ export default function TwoFATools() {
         @keyframes spin {
           to {
             transform: rotate(360deg);
+          }
+        }
+        @keyframes scanLine {
+          0% {
+            top: 15%;
+          }
+          50% {
+            top: 80%;
+          }
+          100% {
+            top: 15%;
           }
         }
       `}</style>

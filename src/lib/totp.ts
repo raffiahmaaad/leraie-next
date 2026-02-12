@@ -147,3 +147,39 @@ export function formatSecret(secret: string): string {
   const cleaned = secret.replace(/\s/g, "").toUpperCase();
   return cleaned.match(/.{1,4}/g)?.join(" ") || cleaned;
 }
+
+/**
+ * Parse an otpauth:// URI into account name and secret
+ * Format: otpauth://totp/Label?secret=XXX&issuer=YYY
+ */
+export function parseOtpAuthUri(uri: string): {
+  name: string;
+  secret: string;
+  issuer?: string;
+} | null {
+  try {
+    if (!uri.startsWith("otpauth://totp/")) return null;
+
+    const url = new URL(uri);
+    const secret = url.searchParams.get("secret");
+    if (!secret) return null;
+
+    const cleanedSecret = secret.replace(/\s/g, "").toUpperCase();
+    if (!isValidSecret(cleanedSecret)) return null;
+
+    const issuer = url.searchParams.get("issuer") || undefined;
+
+    // Label is the path after /totp/ — may be "Issuer:user@email" or just "Label"
+    let label = decodeURIComponent(url.pathname.replace(/^\/totp\//, ""));
+    // If label contains "Issuer:", strip the issuer prefix
+    if (label.includes(":")) {
+      label = label.split(":").slice(1).join(":").trim();
+    }
+
+    const name = label || issuer || "Imported Account";
+
+    return { name, secret: cleanedSecret, issuer };
+  } catch {
+    return null;
+  }
+}
