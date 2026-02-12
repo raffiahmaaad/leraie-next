@@ -2,6 +2,7 @@
  * TOTP (Time-based One-Time Password) Implementation
  * Based on RFC 6238 and RFC 4226
  * Uses Web Crypto API for HMAC-SHA1
+ * by Leraie.
  */
 
 const BASE32_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
