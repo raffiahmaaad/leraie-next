@@ -182,6 +182,55 @@ export default function TwoFATools() {
     showToast(`${name} updated successfully`, "success");
   };
 
+  const exportBackupJSON = () => {
+    if (accounts.length === 0)
+      return showToast("No accounts to export", "error");
+    const data = accounts.map((acc) => ({
+      name: acc.name,
+      secret: acc.secret,
+      createdAt: new Date(acc.createdAt).toISOString(),
+    }));
+    const blob = new Blob([JSON.stringify(data, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const date = new Date().toISOString().slice(0, 10);
+    a.href = url;
+    a.download = `2fa-backup-${date}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast("JSON backup downloaded!", "success");
+  };
+
+  const exportBackupTXT = () => {
+    if (accounts.length === 0)
+      return showToast("No accounts to export", "error");
+    const lines = [
+      `2FA Backup - ${new Date().toLocaleString()}`,
+      `Total Accounts: ${accounts.length}`,
+      "=".repeat(50),
+      "",
+      ...accounts
+        .map((acc, i) => [
+          `${i + 1}. ${acc.name}`,
+          `   Secret Key: ${acc.secret}`,
+          `   Created: ${new Date(acc.createdAt).toLocaleString()}`,
+          "",
+        ])
+        .flat(),
+    ];
+    const blob = new Blob([lines.join("\n")], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const date = new Date().toISOString().slice(0, 10);
+    a.href = url;
+    a.download = `2fa-backup-${date}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast("TXT backup downloaded!", "success");
+  };
+
   const progress = (remainingSeconds / 30) * 100;
 
   return (
@@ -391,6 +440,54 @@ export default function TwoFATools() {
                   {accounts.length}
                 </span>
               </h3>
+              {accounts.length > 0 && (
+                <div style={{ display: "flex", gap: "8px" }}>
+                  <button
+                    onClick={exportBackupJSON}
+                    className="btn btn-secondary"
+                    style={{ padding: "8px 16px", fontSize: "13px" }}
+                    title="Download backup as JSON file"
+                  >
+                    <svg
+                      width="16"
+                      height="16"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
+                      />
+                    </svg>
+                    JSON
+                  </button>
+                  <button
+                    onClick={exportBackupTXT}
+                    className="btn btn-secondary"
+                    style={{ padding: "8px 16px", fontSize: "13px" }}
+                    title="Download backup as readable TXT file"
+                  >
+                    <svg
+                      width="16"
+                      height="16"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
+                      />
+                    </svg>
+                    TXT
+                  </button>
+                </div>
+              )}
             </div>
 
             {!isLoaded ? (
